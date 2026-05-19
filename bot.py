@@ -41,7 +41,8 @@ SCALING_VALUE = float(
     os.getenv("SCALING_VALUE", "1")
 )
 
-# 100 SERIES STEP
+# SERIES STEP
+# 100 => 4500 / 4400 / 4300
 LEVEL_STEP = int(
     os.getenv("LEVEL_STEP", "100")
 )
@@ -76,11 +77,13 @@ def default_state():
 def load_state():
 
     if not os.path.exists(STATE_FILE):
+
         return default_state()
 
     try:
 
         with open(STATE_FILE, "r") as f:
+
             return json.load(f)
 
     except:
@@ -90,6 +93,7 @@ def load_state():
 def save_state():
 
     with open(STATE_FILE, "w") as f:
+
         json.dump(state, f, indent=2)
 
 state = load_state()
@@ -227,28 +231,39 @@ def get_position_size():
 
 def get_lot_size(price):
 
-    # FIRST BUY = BASE PRICE
+    # FIRST BUY PRICE
     if state["base_price"] is None:
 
-        state["base_price"] = price
+        state["base_price"] = float(price)
 
         save_state()
 
-    base_price = state["base_price"]
+    base_price = float(
+        state["base_price"]
+    )
 
-    # HOW MUCH BELOW BASE
-    diff = base_price - price
+    # EXAMPLE:
+    #
+    # BASE = 4541
+    #
+    # 4541 = 1 LOT
+    # 4501 = 1 LOT
+    # 4499 = 2 LOT
+    # 4400 BELOW = 3 LOT
 
-    # SAME SERIES
-    if diff <= 0:
+    base_zone = int(
+        base_price // LEVEL_STEP
+    )
 
-        levels_down = 0
+    current_zone = int(
+        price // LEVEL_STEP
+    )
 
-    else:
-
-        levels_down = int(
-            diff // LEVEL_STEP
-        ) + 1
+    # HOW MANY SERIES DOWN
+    levels_down = max(
+        0,
+        base_zone - current_zone
+    )
 
     lot = BASE_LOT
 
@@ -266,7 +281,7 @@ def get_lot_size(price):
 
     return max(
         1,
-        int(lot)
+        int(round(lot))
     )
 
 # =========================================================
@@ -313,9 +328,9 @@ def execute_buy(price):
 
         state["positions"].append({
 
-            "buy_price": price,
+            "buy_price": float(price),
 
-            "qty": qty
+            "qty": int(qty)
 
         })
 
@@ -341,7 +356,7 @@ def execute_sell(position):
 
     )
 
-    # NEVER SHORT
+    # NEVER SHORT SELL
     if qty <= 0:
 
         print("SELL BLOCKED")
@@ -374,7 +389,11 @@ def execute_sell(position):
 print("===================================")
 print("XAUTUSD GRID BOT STARTED")
 print("PRODUCT ID:", PRODUCT_ID)
+print("GRID SIZE:", GRID_SIZE)
+print("BASE LOT:", BASE_LOT)
 print("SCALING MODE:", SCALING_MODE)
+print("SCALING VALUE:", SCALING_VALUE)
+print("LEVEL STEP:", LEVEL_STEP)
 print("STATE:", state)
 print("===================================")
 
@@ -398,7 +417,7 @@ while True:
         )
 
         # =================================================
-        # RESET SAFETY
+        # SAFETY RESET
         # =================================================
 
         if pos_size <= 0 and len(state["positions"]) > 0:
@@ -448,7 +467,7 @@ while True:
 
                 for p in state["positions"]:
 
-                    # SAME LEVEL BUY BLOCK
+                    # SAME BUY BLOCK
                     if abs(
                         p["buy_price"] - price
                     ) < 1:
