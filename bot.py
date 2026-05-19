@@ -21,18 +21,21 @@ API_SECRET = os.getenv("DELTA_API_SECRET")
 
 GRID_SIZE = float(os.getenv("GRID_SIZE", "15"))
 
-BASE_LOT = int(os.getenv("BASE_LOT", "10"))
+# START LOT
+BASE_LOT = int(os.getenv("BASE_LOT", "1"))
 
+# add / multiply
 SCALING_MODE = os.getenv(
     "SCALING_MODE",
-    "multiply"
+    "add"
 ).lower()
 
 SCALING_VALUE = float(
-    os.getenv("SCALING_VALUE", "2")
+    os.getenv("SCALING_VALUE", "1")
 )
 
-LEVEL_STEP = float(
+# SERIES STEP
+LEVEL_STEP = int(
     os.getenv("LEVEL_STEP", "100")
 )
 
@@ -59,6 +62,7 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
+
     except:
         return default_state()
 
@@ -95,9 +99,7 @@ def private_get(endpoint):
         + endpoint
     )
 
-    signature = generate_signature(
-        signature_data
-    )
+    signature = generate_signature(signature_data)
 
     headers = {
         "Accept": "application/json",
@@ -134,9 +136,7 @@ def private_post(endpoint, payload):
         + body
     )
 
-    signature = generate_signature(
-        signature_data
-    )
+    signature = generate_signature(signature_data)
 
     headers = {
         "Accept": "application/json",
@@ -156,7 +156,7 @@ def private_post(endpoint, payload):
     return r.json()
 
 # =========================================================
-# MARKET DATA
+# LIVE PRICE
 # =========================================================
 
 def get_live_price():
@@ -168,12 +168,10 @@ def get_live_price():
 
     data = r.json()
 
-    return float(
-        data["result"]["close"]
-    )
+    return float(data["result"]["close"])
 
 # =========================================================
-# POSITION
+# POSITION SIZE
 # =========================================================
 
 def get_position_size():
@@ -195,20 +193,29 @@ def get_position_size():
     return total
 
 # =========================================================
-# LOT ENGINE
+# SERIES LOGIC
 # =========================================================
 
 def get_series(price):
 
     return int(price // LEVEL_STEP)
 
+# =========================================================
+# LOT SIZE ENGINE
+# =========================================================
+
 def get_lot_size(price):
+
+    # BASE SERIES
+    # 4700 => base lot
+    base_series = 47
 
     current_series = get_series(price)
 
-    highest_series = get_series(100000)
-
-    diff = highest_series - current_series
+    diff = max(
+        0,
+        base_series - current_series
+    )
 
     lot = BASE_LOT
 
@@ -222,7 +229,6 @@ def get_lot_size(price):
 
             lot = lot + SCALING_VALUE
 
-    # XAUT requires integer lots
     return max(1, int(lot))
 
 # =========================================================
@@ -321,6 +327,7 @@ def execute_sell(position):
 print("===================================")
 print("XAUTUSD GRID BOT STARTED")
 print("PRODUCT ID:", PRODUCT_ID)
+print("SCALING MODE:", SCALING_MODE)
 print("STATE:", state)
 print("===================================")
 
@@ -381,7 +388,9 @@ while True:
 
             last_buy_price = state["positions"][-1]["buy_price"]
 
-            trigger = last_buy_price - GRID_SIZE
+            trigger = (
+                last_buy_price - GRID_SIZE
+            )
 
             if price <= trigger:
 
