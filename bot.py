@@ -19,10 +19,15 @@ PRODUCT_ID = 131253
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
-GRID_SIZE = float(os.getenv("GRID_SIZE", "15"))
+# GRID GAP
+GRID_SIZE = float(
+    os.getenv("GRID_SIZE", "15")
+)
 
 # START LOT
-BASE_LOT = int(os.getenv("BASE_LOT", "1"))
+BASE_LOT = int(
+    os.getenv("BASE_LOT", "1")
+)
 
 # add / multiply
 SCALING_MODE = os.getenv(
@@ -30,11 +35,13 @@ SCALING_MODE = os.getenv(
     "add"
 ).lower()
 
+# add=+1
+# multiply=*2
 SCALING_VALUE = float(
     os.getenv("SCALING_VALUE", "1")
 )
 
-# SERIES STEP
+# 100 SERIES STEP
 LEVEL_STEP = int(
     os.getenv("LEVEL_STEP", "100")
 )
@@ -46,12 +53,24 @@ SLEEP_SECONDS = int(
 STATE_FILE = "state.json"
 
 # =========================================================
+# VALIDATION
+# =========================================================
+
+if not API_KEY:
+    raise Exception("DELTA_API_KEY missing")
+
+if not API_SECRET:
+    raise Exception("DELTA_API_SECRET missing")
+
+# =========================================================
 # STATE
 # =========================================================
 
 def default_state():
+
     return {
-        "positions": []
+        "positions": [],
+        "base_price": None
     }
 
 def load_state():
@@ -60,10 +79,12 @@ def load_state():
         return default_state()
 
     try:
+
         with open(STATE_FILE, "r") as f:
             return json.load(f)
 
     except:
+
         return default_state()
 
 def save_state():
@@ -99,7 +120,9 @@ def private_get(endpoint):
         + endpoint
     )
 
-    signature = generate_signature(signature_data)
+    signature = generate_signature(
+        signature_data
+    )
 
     headers = {
         "Accept": "application/json",
@@ -136,7 +159,9 @@ def private_post(endpoint, payload):
         + body
     )
 
-    signature = generate_signature(signature_data)
+    signature = generate_signature(
+        signature_data
+    )
 
     headers = {
         "Accept": "application/json",
@@ -168,7 +193,9 @@ def get_live_price():
 
     data = r.json()
 
-    return float(data["result"]["close"])
+    return float(
+        data["result"]["close"]
+    )
 
 # =========================================================
 # POSITION SIZE
@@ -187,52 +214,63 @@ def get_position_size():
         if p.get("product_symbol") == SYMBOL:
 
             total += int(
-                float(p.get("size", 0))
+                float(
+                    p.get("size", 0)
+                )
             )
 
     return total
 
 # =========================================================
-# SERIES LOGIC
-# =========================================================
-
-def get_series(price):
-
-    return int(price // LEVEL_STEP)
-
-# =========================================================
-# LOT SIZE ENGINE
+# LOT ENGINE
 # =========================================================
 
 def get_lot_size(price):
 
-    # BASE SERIES
-    # 4700 => base lot
-    base_series = 47
+    # FIRST BUY = BASE PRICE
+    if state["base_price"] is None:
 
-    current_series = get_series(price)
+        state["base_price"] = price
 
-    diff = max(
-        0,
-        base_series - current_series
-    )
+        save_state()
+
+    base_price = state["base_price"]
+
+    # HOW MUCH BELOW BASE
+    diff = base_price - price
+
+    # SAME SERIES
+    if diff <= 0:
+
+        levels_down = 0
+
+    else:
+
+        levels_down = int(
+            diff // LEVEL_STEP
+        ) + 1
 
     lot = BASE_LOT
 
-    for _ in range(diff):
+    for _ in range(levels_down):
 
+        # MULTIPLY MODE
         if SCALING_MODE == "multiply":
 
             lot = lot * SCALING_VALUE
 
+        # ADD MODE
         elif SCALING_MODE == "add":
 
             lot = lot + SCALING_VALUE
 
-    return max(1, int(lot))
+    return max(
+        1,
+        int(lot)
+    )
 
 # =========================================================
-# ORDER
+# PLACE ORDER
 # =========================================================
 
 def place_market_order(side, qty):
@@ -274,8 +312,11 @@ def execute_buy(price):
     if response.get("success") is True:
 
         state["positions"].append({
+
             "buy_price": price,
+
             "qty": qty
+
         })
 
         save_state()
@@ -293,12 +334,18 @@ def execute_sell(position):
     pos_size = get_position_size()
 
     qty = min(
+
         int(position["qty"]),
+
         int(pos_size)
+
     )
 
     # NEVER SHORT
     if qty <= 0:
+
+        print("SELL BLOCKED")
+
         return
 
     response = place_market_order(
@@ -351,7 +398,25 @@ while True:
         )
 
         # =================================================
-        # NO POSITION -> AUTO BUY
+        # RESET SAFETY
+        # =================================================
+
+        if pos_size <= 0 and len(state["positions"]) > 0:
+
+            print("RESETTING POSITION STATE")
+
+            state["positions"] = []
+
+            state["base_price"] = None
+
+            save_state()
+
+            time.sleep(SLEEP_SECONDS)
+
+            continue
+
+        # =================================================
+        # FIRST AUTO BUY
         # =================================================
 
         if pos_size <= 0 and len(state["positions"]) == 0:
@@ -365,22 +430,6 @@ while True:
             continue
 
         # =================================================
-        # RESET SAFETY
-        # =================================================
-
-        if pos_size <= 0 and len(state["positions"]) > 0:
-
-            print("RESETTING POSITIONS")
-
-            state["positions"] = []
-
-            save_state()
-
-            time.sleep(SLEEP_SECONDS)
-
-            continue
-
-        # =================================================
         # GRID BUY
         # =================================================
 
@@ -388,16 +437,18 @@ while True:
 
             last_buy_price = state["positions"][-1]["buy_price"]
 
-            trigger = (
-                last_buy_price - GRID_SIZE
+            next_buy = (
+                last_buy_price
+                - GRID_SIZE
             )
 
-            if price <= trigger:
+            if price <= next_buy:
 
                 duplicate = False
 
                 for p in state["positions"]:
 
+                    # SAME LEVEL BUY BLOCK
                     if abs(
                         p["buy_price"] - price
                     ) < 1:
@@ -407,7 +458,9 @@ while True:
 
                 if not duplicate:
 
-                    print("GRID BUY TRIGGER")
+                    print(
+                        "GRID BUY TRIGGER"
+                    )
 
                     execute_buy(price)
 
