@@ -19,30 +19,23 @@ PRODUCT_ID = 131253
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
-# GRID GAP
 GRID_SIZE = float(
     os.getenv("GRID_SIZE", "15")
 )
 
-# START LOT
 BASE_LOT = int(
     os.getenv("BASE_LOT", "1")
 )
 
-# add / multiply
 SCALING_MODE = os.getenv(
     "SCALING_MODE",
     "add"
 ).lower()
 
-# add=+1
-# multiply=*2
 SCALING_VALUE = float(
     os.getenv("SCALING_VALUE", "1")
 )
 
-# SERIES STEP
-# 100 => 4500 / 4400 / 4300
 LEVEL_STEP = int(
     os.getenv("LEVEL_STEP", "100")
 )
@@ -71,7 +64,11 @@ def default_state():
 
     return {
         "positions": [],
-        "base_price": None
+        "base_price": None,
+
+        # FIX ONLY
+        "zero_counter": 0,
+        "pending_order": False
     }
 
 def load_state():
@@ -84,7 +81,15 @@ def load_state():
 
         with open(STATE_FILE, "r") as f:
 
-            return json.load(f)
+            data = json.load(f)
+
+            if "zero_counter" not in data:
+                data["zero_counter"] = 0
+
+            if "pending_order" not in data:
+                data["pending_order"] = False
+
+            return data
 
     except:
 
@@ -231,7 +236,6 @@ def get_position_size():
 
 def get_lot_size(price):
 
-    # FIRST BUY PRICE
     if state["base_price"] is None:
 
         state["base_price"] = float(price)
@@ -242,15 +246,6 @@ def get_lot_size(price):
         state["base_price"]
     )
 
-    # EXAMPLE:
-    #
-    # BASE = 4541
-    #
-    # 4541 = 1 LOT
-    # 4501 = 1 LOT
-    # 4499 = 2 LOT
-    # 4400 BELOW = 3 LOT
-
     base_zone = int(
         base_price // LEVEL_STEP
     )
@@ -259,7 +254,6 @@ def get_lot_size(price):
         price // LEVEL_STEP
     )
 
-    # HOW MANY SERIES DOWN
     levels_down = max(
         0,
         base_zone - current_zone
@@ -269,12 +263,10 @@ def get_lot_size(price):
 
     for _ in range(levels_down):
 
-        # MULTIPLY MODE
         if SCALING_MODE == "multiply":
 
             lot = lot * SCALING_VALUE
 
-        # ADD MODE
         elif SCALING_MODE == "add":
 
             lot = lot + SCALING_VALUE
@@ -285,7 +277,7 @@ def get_lot_size(price):
     )
 
 # =========================================================
-# PLACE ORDER
+# ORDER
 # =========================================================
 
 def place_market_order(side, qty):
@@ -317,7 +309,13 @@ def place_market_order(side, qty):
 
 def execute_buy(price):
 
+    if state["pending_order"]:
+        return
+
     qty = get_lot_size(price)
+
+    state["pending_order"] = True
+    save_state()
 
     response = place_market_order(
         "buy",
@@ -340,11 +338,17 @@ def execute_buy(price):
             f"BUY SUCCESS -> PRICE={price} QTY={qty}"
         )
 
+    state["pending_order"] = False
+    save_state()
+
 # =========================================================
 # SELL
 # =========================================================
 
 def execute_sell(position):
+
+    if state["pending_order"]:
+        return
 
     pos_size = get_position_size()
 
@@ -356,12 +360,14 @@ def execute_sell(position):
 
     )
 
-    # NEVER SHORT SELL
     if qty <= 0:
 
         print("SELL BLOCKED")
 
         return
+
+    state["pending_order"] = True
+    save_state()
 
     response = place_market_order(
         "sell",
@@ -381,6 +387,9 @@ def execute_sell(position):
         print(
             f"SELL SUCCESS -> {position}"
         )
+
+    state["pending_order"] = False
+    save_state()
 
 # =========================================================
 # STARTUP
@@ -417,10 +426,30 @@ while True:
         )
 
         # =================================================
-        # SAFETY RESET
+        # FIX:
+        # DELTA API temporary zero ignore
         # =================================================
 
-        if pos_size <= 0 and len(state["positions"]) > 0:
+        if pos_size <= 0:
+            state["zero_counter"] += 1
+        else:
+            state["zero_counter"] = 0
+
+        save_state()
+
+        # =================================================
+        # SAFETY RESET
+        # same logic
+        # only confirm 3 times
+        # =================================================
+
+        if (
+            state["zero_counter"] >= 3
+            and
+            pos_size <= 0
+            and
+            len(state["positions"]) > 0
+        ):
 
             print("RESETTING POSITION STATE")
 
@@ -436,6 +465,7 @@ while True:
 
         # =================================================
         # FIRST AUTO BUY
+        # EXACT SAME
         # =================================================
 
         if pos_size <= 0 and len(state["positions"]) == 0:
@@ -450,6 +480,7 @@ while True:
 
         # =================================================
         # GRID BUY
+        # EXACT SAME
         # =================================================
 
         if len(state["positions"]) > 0:
@@ -467,7 +498,6 @@ while True:
 
                 for p in state["positions"]:
 
-                    # SAME BUY BLOCK
                     if abs(
                         p["buy_price"] - price
                     ) < 1:
@@ -485,6 +515,7 @@ while True:
 
         # =================================================
         # GRID SELL
+        # EXACT SAME
         # =================================================
 
         for position in state["positions"][:]:
