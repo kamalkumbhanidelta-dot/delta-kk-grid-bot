@@ -68,12 +68,14 @@ SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
 REENTRY_COOLDOWN_SECONDS = int(os.getenv("REENTRY_COOLDOWN_SECONDS", "15"))
 NEGATIVE_POS_WAIT_SECONDS = int(os.getenv("NEGATIVE_POS_WAIT_SECONDS", "15"))
 RECOVERY_FILL_SCAN = int(os.getenv("RECOVERY_FILL_SCAN", "800"))
+PENDING_ORDER_WAIT_SECONDS = int(os.getenv("PENDING_ORDER_WAIT_SECONDS", "60"))
 
 API_KEY = os.getenv("DELTA_API_KEY")
 API_SECRET = os.getenv("DELTA_API_SECRET")
 
 STATE_FILE = "state.json"
 LOCK_FILE = "bot.lock"
+STATE_SCHEMA_VERSION = 3
 
 USER_AGENT = "xautusd-grid-bot-FULL-FINAL-NO-SHORT-MANUALSAFE"
 
@@ -93,6 +95,7 @@ print("SERIES_ADD_LOT:", SERIES_ADD_LOT)
 print("REENTRY_COOLDOWN_SECONDS:", REENTRY_COOLDOWN_SECONDS)
 print("NEGATIVE_POS_WAIT_SECONDS:", NEGATIVE_POS_WAIT_SECONDS)
 print("RECOVERY_FILL_SCAN:", RECOVERY_FILL_SCAN)
+print("PENDING_ORDER_WAIT_SECONDS:", PENDING_ORDER_WAIT_SECONDS)
 sys.stdout.flush()
 
 if not API_KEY or not API_SECRET:
@@ -129,9 +132,15 @@ acquire_lock()
 # STATE SYSTEM
 # ============================================================
 
+state_needs_fill_bootstrap = False
+
+
 def default_state():
     return {
+        "state_schema_version": STATE_SCHEMA_VERSION,
         "levels": [],
+        "pending_buybacks": [],
+        "pending_orders": {},
 
         # cycle info
         "cycle_entry_size": None,
@@ -144,37 +153,58 @@ def default_state():
         # duplicate guard
         "last_action": None,
         "last_action_price": None,
+        "last_action_time": 0,
         "last_order_id": None,
 
         # fill tracking
         "last_fill_id": None,
         "last_fill_price": None,
         "last_fill_side": None,
+        "last_grid_buy_price": None,
 
         # processed fill IDs (persisted list)
         "processed_fill_ids": [],
 
         # reentry lock
-        "last_reentry_time": 0
+        "last_reentry_time": 0,
+
+        # duplicate grid protection
+        "pending_grid_prices": {}
     }
 
 
 def load_state():
+    global state_needs_fill_bootstrap
+
     if not os.path.exists(STATE_FILE):
+        state_needs_fill_bootstrap = True
         return default_state()
 
     try:
         with open(STATE_FILE, "r") as f:
             data = json.load(f)
 
+        raw_version = int(data.get("state_schema_version", 1) or 1)
+        if raw_version < STATE_SCHEMA_VERSION:
+            state_needs_fill_bootstrap = True
+
         d = default_state()
         d.update(data)
+        d["state_schema_version"] = STATE_SCHEMA_VERSION
 
         if d.get("levels") is None:
             d["levels"] = []
 
+        if d.get("pending_buybacks") is None:
+            d["pending_buybacks"] = []
+
+        if d.get("pending_orders") is None or not isinstance(d.get("pending_orders"), dict):
+            d["pending_orders"] = {}
+
         if d.get("processed_fill_ids") is None:
             d["processed_fill_ids"] = []
+        elif not d.get("processed_fill_ids"):
+            state_needs_fill_bootstrap = True
 
         # FIX: remove duplicates safely
         unique_ids = []
@@ -191,9 +221,53 @@ def load_state():
 
         if d.get("last_reentry_time") is None:
             d["last_reentry_time"] = 0
+        
+        if d.get("last_action_time") is None:
+            d["last_action_time"] = 0    
+
+        if d.get("pending_grid_prices") is None:
+            d["pending_grid_prices"] = {}
+
+        if d.get("last_grid_buy_price") is not None:
+            d["last_grid_buy_price"] = float(d["last_grid_buy_price"])
+
+        # v2 had unsafe historical buyback recovery. Never carry that backlog forward.
+        if raw_version < STATE_SCHEMA_VERSION:
+            d["pending_buybacks"] = []
+            d["pending_orders"] = {}
+
+        clean_buybacks = []
+
+        for b in d.get("pending_buybacks", []):
+
+            try:
+                size = float(b.get("size", 0))
+
+                if size <= 0:
+                    continue
+
+                clean_buybacks.append({
+                    "id": str(b.get("id") or f"legacy-{len(clean_buybacks) + 1}"),
+                    "buy_price": float(b.get("buy_price")),
+                    "size": size,
+                    "is_cycle": bool(b.get("is_cycle", False)),
+                    "source_sell_price": b.get("source_sell_price"),
+                    "source_fill_price": b.get("source_fill_price"),
+                    "source_fill_id": b.get("source_fill_id")
+                })
+
+            except:
+                continue
+
+        d["pending_buybacks"] = sorted(
+            clean_buybacks,
+            key=lambda x: float(x["buy_price"]),
+            reverse=True
+        )
 
         return d
     except:
+        state_needs_fill_bootstrap = True
         return default_state()
 
 
@@ -347,17 +421,202 @@ def place_market_order(side: str, size: float):
 # ============================================================
 
 def already_executed_same_price(action, price):
-    if state.get("last_action") == action and state.get("last_action_price") is not None:
-        if abs(float(state["last_action_price"]) - float(price)) < 0.01:
+
+    # ONLY prevent exact duplicate action instantly.
+    # Do NOT block future valid grid executions.
+
+    last_action = state.get("last_action")
+    last_price = state.get("last_action_price")
+
+    if last_action != action:
+        return False
+
+    if last_price is None:
+        return False
+
+    # only block within very tiny window
+    if abs(float(last_price) - float(price)) < 0.01:
+
+        now = int(time.time())
+        last_time = int(state.get("last_action_time", 0))
+
+        # only 3 sec protection
+        if now - last_time <= 3:
             return True
+
     return False
 
 
-def mark_action(action, price, order_id=None):
+def get_fill_order_id(fill):
+    for key in ("order_id", "order_id_str", "orderId", "orderID"):
+        value = fill.get(key)
+        if value is not None:
+            return str(value)
+
+    order_data = fill.get("order")
+    if isinstance(order_data, dict) and order_data.get("id") is not None:
+        return str(order_data.get("id"))
+
+    return None
+
+
+def remember_pending_order(order_id, action, trigger_price, size=None, source=None, extra=None):
+    if order_id is None:
+        return
+
+    oid = str(order_id)
+    data = {
+        "action": action,
+        "trigger_price": float(trigger_price),
+        "remaining_size": float(size) if size is not None else None,
+        "source": source or action,
+        "created_at": int(time.time())
+    }
+
+    if extra:
+        data.update(extra)
+
+    state["pending_orders"][oid] = data
+
+    # Market orders should fill quickly; this only prevents stale state growth.
+    if len(state["pending_orders"]) > 200:
+        ordered = sorted(state["pending_orders"].items(), key=lambda x: int(x[1].get("created_at", 0)))
+        state["pending_orders"] = dict(ordered[-100:])
+
+    save_state()
+
+
+def get_pending_order(order_id):
+    if order_id is None:
+        return None
+    return state.get("pending_orders", {}).get(str(order_id))
+
+
+def consume_pending_order_fill(order_id, fill_size):
+    if order_id is None:
+        return
+
+    oid = str(order_id)
+    pending = state.get("pending_orders", {}).get(oid)
+    if not pending:
+        return
+
+    remaining = pending.get("remaining_size")
+    if remaining is None:
+        state["pending_orders"].pop(oid, None)
+        save_state()
+        return
+
+    remaining = float(remaining) - float(fill_size)
+    if remaining <= 0.00001:
+        state["pending_orders"].pop(oid, None)
+    else:
+        state["pending_orders"][oid]["remaining_size"] = remaining
+
+    save_state()
+
+# ============================================================
+# CLEAN STALE RESERVED GRID PRICES
+# ============================================================
+
+def cleanup_stale_pending_grid_prices():
+
+    reserved = state.get("pending_grid_prices", {})
+
+    if not reserved:
+        return
+
+    now = int(time.time())
+
+    remove_keys = []
+
+    for key, data in reserved.items():
+
+        try:
+            created_at = int(data.get("created_at", 0))
+        except:
+            created_at = 0
+
+        # remove after 60 seconds
+        if now - created_at > 60:
+            remove_keys.append(key)
+
+    if remove_keys:
+
+        for key in remove_keys:
+            print("REMOVING STALE RESERVED PRICE:", key)
+            sys.stdout.flush()
+
+            state["pending_grid_prices"].pop(key, None)
+
+        save_state()
+
+def has_fresh_pending_orders():
+    pending_orders = state.get("pending_orders", {})
+    if not pending_orders:
+        return False
+
+    now = int(time.time())
+    stale_order_ids = []
+    fresh_count = 0
+
+    for oid, pending in pending_orders.items():
+        created_at = int(pending.get("created_at", 0) or 0)
+        if now - created_at <= PENDING_ORDER_WAIT_SECONDS:
+            fresh_count += 1
+        else:
+            stale_order_ids.append(oid)
+
+    if stale_order_ids:
+        for oid in stale_order_ids:
+            state["pending_orders"].pop(oid, None)
+        save_state()
+
+    return fresh_count > 0
+
+def cleanup_stale_grid_reservations():
+
+    now = int(time.time())
+
+    stale_keys = []
+
+    for price_key, data in state.get("pending_grid_prices", {}).items():
+
+        created_at = int(data.get("created_at", 0))
+
+        # 60 sec expiry
+        if now - created_at > 60:
+            stale_keys.append(price_key)
+
+    if stale_keys:
+
+        for k in stale_keys:
+            del state["pending_grid_prices"][k]
+
+        save_state()
+
+        print("CLEANED STALE GRID RESERVATIONS:", stale_keys)
+        sys.stdout.flush()
+
+
+def mark_action(action, price, order_id=None, size=None, source=None, extra=None):
+
     state["last_action"] = action
     state["last_action_price"] = float(price)
+    state["last_action_time"] = int(time.time())
     state["last_order_id"] = order_id
+
     save_state()
+
+    if order_id is not None:
+        remember_pending_order(
+            order_id,
+            action,
+            price,
+            size=size,
+            source=source,
+            extra=extra
+        )
 
 
 # ============================================================
@@ -395,6 +654,15 @@ def sort_levels():
     save_state()
 
 
+def sort_pending_buybacks():
+    state["pending_buybacks"] = sorted(
+        state.get("pending_buybacks", []),
+        key=lambda x: float(x["buy_price"]),
+        reverse=True
+    )
+    save_state()
+
+
 def add_level(buy_price, size, is_cycle=False):
     buy_price = float(buy_price)
     size = float(size)
@@ -406,11 +674,76 @@ def add_level(buy_price, size, is_cycle=False):
         "buy_price": buy_price,
         "sell_price": buy_price + GRID,
         "size": size,
+        "series": get_series_floor(buy_price),
         "is_cycle": bool(is_cycle)
     }
 
     state["levels"].append(level)
     sort_levels()
+
+
+def add_pending_buyback(buy_price, size, is_cycle=False, source_sell_price=None, source_fill_price=None, source_fill_id=None):
+    buy_price = float(buy_price)
+    size = float(size)
+
+    if size <= 0:
+        return None
+
+    buyback_id = str(source_fill_id or f"buyback-{int(time.time() * 1000)}-{len(state.get('pending_buybacks', [])) + 1}")
+
+    # Merge same-price buybacks so the log stays readable and order size remains correct.
+    for b in state.get("pending_buybacks", []):
+        if abs(float(b["buy_price"]) - buy_price) < 0.01 and bool(b.get("is_cycle", False)) == bool(is_cycle):
+            b["size"] = float(b.get("size", 0)) + size
+            if source_sell_price is not None:
+                b["source_sell_price"] = source_sell_price
+            if source_fill_price is not None:
+                b["source_fill_price"] = source_fill_price
+            if source_fill_id is not None:
+                b["source_fill_id"] = source_fill_id
+            sort_pending_buybacks()
+            return b
+
+    buyback = {
+        "id": buyback_id,
+        "buy_price": buy_price,
+        "size": size,
+        "is_cycle": bool(is_cycle),
+        "source_sell_price": source_sell_price,
+        "source_fill_price": source_fill_price,
+        "source_fill_id": source_fill_id
+    }
+
+    state["pending_buybacks"].append(buyback)
+    sort_pending_buybacks()
+    return buyback
+
+
+def reduce_pending_buyback(buyback_id=None, buy_price=None, used_size=0):
+    used_size = float(used_size)
+    if used_size <= 0:
+        return None
+
+    for i, b in enumerate(state.get("pending_buybacks", [])):
+        id_match = buyback_id is not None and str(b.get("id")) == str(buyback_id)
+        price_match = buy_price is not None and abs(float(b.get("buy_price")) - float(buy_price)) < 0.01
+
+        if not id_match and not price_match:
+            continue
+
+        current_size = float(b.get("size", 0))
+        used = min(used_size, current_size)
+
+        if used >= current_size - 0.00001:
+            removed = state["pending_buybacks"].pop(i)
+            save_state()
+            return removed
+
+        state["pending_buybacks"][i]["size"] = current_size - used
+        save_state()
+        return state["pending_buybacks"][i]
+
+    return None
 
 
 def get_total_level_size():
@@ -422,6 +755,10 @@ def get_total_level_size():
 
 def reset_all_levels():
     state["levels"] = []
+    state["pending_buybacks"] = []
+    state["pending_orders"] = {}
+    state["pending_grid_prices"] = {}
+    state["last_grid_buy_price"] = None
     state["cycle_entry_size"] = None
     state["cycle_entry_price"] = None
     state["cycle_entry_sell_price"] = None
@@ -429,32 +766,88 @@ def reset_all_levels():
     save_state()
 
 
-def reduce_exact_sell_level(fill_price, sold_size):
-    fill_price = float(fill_price)
+def reduce_sell_level_by_index(index, sold_size):
     sold_size = float(sold_size)
 
-    for i, lv in enumerate(state["levels"]):
-        if abs(float(lv["sell_price"]) - fill_price) < 0.20:
-            current_size = float(lv["size"])
+    if index is None or index < 0 or index >= len(state["levels"]):
+        return None
 
-            if sold_size >= current_size - 0.00001:
-                removed = state["levels"].pop(i)
-                save_state()
-                return removed
-            else:
-                state["levels"][i]["size"] = current_size - sold_size
-                save_state()
-                return state["levels"][i]
+    lv = state["levels"][index]
+    current_size = float(lv["size"])
+    used_size = min(sold_size, current_size)
+
+    sold_info = {
+        "buy_price": float(lv["buy_price"]),
+        "sell_price": float(lv["sell_price"]),
+        "size": used_size,
+        "remaining_size_before": current_size,
+        "remaining_size_after": current_size - used_size,
+        "is_cycle": bool(lv.get("is_cycle", False))
+    }
+
+    if used_size >= current_size - 0.00001:
+        state["levels"].pop(index)
+    else:
+        state["levels"][index]["size"] = current_size - used_size
+
+    save_state()
+    return sold_info
+
+
+def reduce_sell_level_by_target(target_price, sold_size):
+    target_price = float(target_price)
+
+    for i, lv in enumerate(state["levels"]):
+        if abs(float(lv["sell_price"]) - target_price) < 0.01:
+            return reduce_sell_level_by_index(i, sold_size)
 
     return None
 
 
-def reduce_closest_sell_level(fill_price, sold_size):
-    if not state["levels"]:
-        return None
-
+def reduce_sell_level_by_fill(fill_price, sold_size):
     fill_price = float(fill_price)
-    sold_size = float(sold_size)
+
+    # FIRST: exact target match
+    exact_matches = []
+
+    for i, lv in enumerate(state["levels"]):
+
+        sell_price = float(lv["sell_price"])
+
+        if abs(sell_price - fill_price) <= 0.25:
+            exact_matches.append((i, lv))
+
+    # Prefer smallest sell target first
+    if exact_matches:
+
+        exact_matches = sorted(
+            exact_matches,
+            key=lambda x: float(x[1]["sell_price"])
+        )
+
+        return reduce_sell_level_by_index(
+            exact_matches[0][0],
+            sold_size
+        )
+
+    # SECOND: fallback older logic
+    eligible = []
+
+    for i, lv in enumerate(state["levels"]):
+
+        sell_price = float(lv["sell_price"])
+
+        if sell_price <= fill_price + 0.20:
+            eligible.append((i, sell_price))
+
+    if eligible:
+
+        eligible = sorted(eligible, key=lambda x: x[1])
+
+        return reduce_sell_level_by_index(
+            eligible[0][0],
+            sold_size
+        )
 
     closest_index = None
     closest_diff = 999999
@@ -465,29 +858,87 @@ def reduce_closest_sell_level(fill_price, sold_size):
             closest_diff = diff
             closest_index = i
 
-    if closest_index is None:
+    if closest_index is not None and closest_diff <= 5.0:
+        return reduce_sell_level_by_index(closest_index, sold_size)
+
+    return None
+
+
+def reduce_exact_sell_level(fill_price, sold_size):
+    fill_price = float(fill_price)
+    return reduce_sell_level_by_target(fill_price, sold_size)
+
+
+def reduce_closest_sell_level(fill_price, sold_size):
+    return reduce_sell_level_by_fill(fill_price, sold_size)
+
+
+def get_next_downside_buy_price():
+    if not state["levels"]:
         return None
 
-    if closest_diff > 5.0:
+    candidates = []
+    lowest_buy = min([float(lv["buy_price"]) for lv in state["levels"]])
+    candidates.append(float(lowest_buy - GRID))
+
+    if state.get("last_grid_buy_price") is not None:
+        candidates.append(float(state["last_grid_buy_price"]) - GRID)
+
+    return max(candidates)
+
+
+def get_next_buy_target():
+    reserved_prices = state.get("pending_grid_prices", {})    
+    
+    candidates = []
+
+    for b in state.get("pending_buybacks", []):
+
+        # skip reserved prices
+        price_key = str(round(float(b["buy_price"]), 2))
+
+        if price_key in reserved_prices:
+            continue
+
+        if float(b.get("size", 0)) > 0:
+            candidates.append({
+                "source": "buyback",
+                "buy_price": float(b["buy_price"]),
+                "size": float(b["size"]),
+                "is_cycle": bool(b.get("is_cycle", False)),
+                "buyback_id": b.get("id")
+            })
+
+    downside_buy = get_next_downside_buy_price()
+
+    if downside_buy is not None:
+
+         price_key = str(round(float(downside_buy), 2))
+
+         if price_key in reserved_prices:
+             downside_buy = None
+
+    if downside_buy is not None:
+        candidates.append({
+            "source": "downside",
+            "buy_price": float(downside_buy),
+            "size": None,
+            "is_cycle": False,
+            "buyback_id": None
+        })
+
+    if not candidates:
         return None
 
-    current_size = float(state["levels"][closest_index]["size"])
-
-    if sold_size >= current_size - 0.00001:
-        removed = state["levels"].pop(closest_index)
-        save_state()
-        return removed
-    else:
-        state["levels"][closest_index]["size"] = current_size - sold_size
-        save_state()
-        return state["levels"][closest_index]
+    candidates = sorted(candidates, key=lambda x: float(x["buy_price"]), reverse=True)
+    return candidates[0]
 
 
 def get_next_buy_price():
-    if not state["levels"]:
+    target = get_next_buy_target()
+    if target is None:
         return None
-    lowest_buy = min([float(lv["buy_price"]) for lv in state["levels"]])
-    return float(lowest_buy - GRID)
+    return float(target["buy_price"])
 
 
 def get_next_sell_target(price):
@@ -652,40 +1103,134 @@ def process_new_fills():
         fill_price = float(f.get("price"))
         fill_side = f.get("side")
         fill_size = float(f.get("size", 0))
+        order_id = get_fill_order_id(f)
+        pending = get_pending_order(order_id)
 
         if fill_size <= 0:
             continue
 
-        print("PROCESSING NEW FILL:", fill_side, fill_price, fill_size, "ID:", fid)
+        print("PROCESSING NEW FILL:", fill_side, fill_price, fill_size, "ID:", fid, "ORDER:", order_id, "PENDING:", pending)
         sys.stdout.flush()
 
         # ============================================================
         # FIX: MANUAL BUY SPLIT LOGIC INSIDE FILL PROCESSING
         # ============================================================
         if fill_side == "buy":
-            cycle_target = get_cycle_target_size()
-            current_cycle = get_current_cycle_size()
-            cycle_missing = max(0.0, cycle_target - current_cycle)
+            source = pending.get("source") if pending else None
 
-            if cycle_missing > 0:
-                cycle_add = min(fill_size, cycle_missing)
-                if cycle_add > 0:
-                    print("FILL BUY -> SPLIT: ADDING CYCLE:", cycle_add)
-                    sys.stdout.flush()
-                    add_level(fill_price, cycle_add, is_cycle=True)
+            if source == "entry":
+                print("FILL BUY -> ENTRY CYCLE:", fill_size)
+                sys.stdout.flush()
+                add_level(fill_price, fill_size, is_cycle=True)
 
-                remaining = fill_size - cycle_add
-                if remaining > 0:
-                    print("FILL BUY -> SPLIT: ADDING NORMAL:", remaining)
-                    sys.stdout.flush()
-                    add_level(fill_price, remaining, is_cycle=False)
-            else:
+            elif source == "buyback":
+                print("FILL BUY -> RECYCLED BUYBACK:", fill_size, "AT:", fill_price)
+                sys.stdout.flush()
+                reduce_pending_buyback(
+                    buyback_id=pending.get("buyback_id"),
+                    buy_price=pending.get("trigger_price"),
+                    used_size=fill_size
+                )
+                add_level(fill_price, fill_size, is_cycle=bool(pending.get("is_cycle", False)))
+
+            elif source == "downside":
+                print("FILL BUY -> DOWNSIDE GRID:", fill_size)
+                sys.stdout.flush()
                 add_level(fill_price, fill_size, is_cycle=False)
 
+            else:
+                cycle_target = get_cycle_target_size()
+                current_cycle = get_current_cycle_size()
+                cycle_missing = max(0.0, cycle_target - current_cycle)
+
+                if cycle_missing > 0:
+                    cycle_add = min(fill_size, cycle_missing)
+                    if cycle_add > 0:
+                        print("FILL BUY -> SPLIT: ADDING CYCLE:", cycle_add)
+                        sys.stdout.flush()
+                        add_level(fill_price, cycle_add, is_cycle=True)
+
+                    remaining = fill_size - cycle_add
+                    if remaining > 0:
+                        print("FILL BUY -> SPLIT: ADDING NORMAL:", remaining)
+                        sys.stdout.flush()
+                        add_level(fill_price, remaining, is_cycle=False)
+                else:
+                    add_level(fill_price, fill_size, is_cycle=False)
+
+            state["last_grid_buy_price"] = fill_price
+            consume_pending_order_fill(order_id, fill_size)
+
+            # ============================================================
+            # REMOVE RESERVED GRID PRICE AFTER BUY FILL
+            # ============================================================
+
+            # REMOVE RESERVED GRID PRICE USING ORIGINAL TRIGGER PRICE
+            if pending is not None:
+
+                trigger_price = pending.get("trigger_price")
+
+                if trigger_price is not None:
+
+                    price_key = str(round(float(trigger_price), 2))
+
+                    if price_key in state["pending_grid_prices"]:
+
+                        del state["pending_grid_prices"][price_key]
+
+                        print("REMOVED RESERVED GRID PRICE:", price_key)
+                        sys.stdout.flush()
+
+            save_state()
+
+
         elif fill_side == "sell":
-            removed = reduce_exact_sell_level(fill_price, fill_size)
-            if removed is None:
-                reduce_closest_sell_level(fill_price, fill_size)
+            sold_info = None
+            source = pending.get("source") if pending else None
+
+            if source == "sell":
+                sold_info = reduce_sell_level_by_target(pending.get("trigger_price"), fill_size)
+
+            if sold_info is None:
+                sold_info = reduce_sell_level_by_fill(fill_price, fill_size)
+
+            if sold_info is not None:
+
+                # ============================================================
+                # BLOCK DUPLICATE BUYBACK FROM SAME SELL FILL
+                # ============================================================
+
+                already_exists = False
+
+                for b in state.get("pending_buybacks", []):
+
+                    if str(b.get("source_fill_id")) == str(fid):
+
+                        already_exists = True
+                        break
+
+                if already_exists:
+
+                    print("DUPLICATE BUYBACK BLOCKED:", fid)
+                    sys.stdout.flush()
+
+                else:
+
+                    buyback_price = fill_price - GRID
+
+                    print("FILL SELL -> ADD BUYBACK:", buyback_price, "SIZE:", sold_info["size"])
+                    sys.stdout.flush()
+
+                    add_pending_buyback(
+                        buyback_price,
+                        sold_info["size"],
+            is_cycle=bool(sold_info.get("is_cycle", False)),
+            source_sell_price=sold_info.get("sell_price"),
+                        source_fill_price=fill_price,
+                        source_fill_id=fid
+                    )
+
+            consume_pending_order_fill(order_id, fill_size)
 
         state["last_fill_id"] = fid
         state["last_fill_price"] = fill_price
@@ -727,6 +1272,7 @@ def rebuild_levels_from_fills(pos_size):
     fills = sorted(fills, key=lambda x: x.get("created_at", ""))
 
     open_levels = []
+    last_grid_buy_price = None
 
     for f in fills:
         side = f.get("side")
@@ -737,6 +1283,7 @@ def rebuild_levels_from_fills(pos_size):
             continue
 
         if side == "buy":
+            last_grid_buy_price = price
             open_levels.append({
                 "buy_price": price,
                 "sell_price": price + GRID,
@@ -747,25 +1294,39 @@ def rebuild_levels_from_fills(pos_size):
         elif side == "sell":
             remaining_sell = size
 
-            open_levels = sorted(open_levels, key=lambda x: abs(float(x["sell_price"]) - price))
+            while remaining_sell > 0 and open_levels:
+                eligible = []
+                for i, lv in enumerate(open_levels):
+                    sell_price = float(lv["sell_price"])
+                    if sell_price <= price + 0.20:
+                        eligible.append((i, sell_price))
 
-            i = 0
-            while i < len(open_levels) and remaining_sell > 0:
-                lv = open_levels[i]
+                if eligible:
+                    target_index = sorted(eligible, key=lambda x: x[1])[0][0]
+                else:
+                    target_index = None
+                    closest_diff = 999999
 
-                if abs(float(lv["sell_price"]) - price) <= 5.0:
-                    lv_size = float(lv["size"])
+                    for i, lv in enumerate(open_levels):
+                        diff = abs(float(lv["sell_price"]) - price)
+                        if diff < closest_diff:
+                            closest_diff = diff
+                            target_index = i
 
-                    if remaining_sell >= lv_size - 0.00001:
-                        remaining_sell -= lv_size
-                        open_levels.pop(i)
-                        continue
-                    else:
-                        lv["size"] = lv_size - remaining_sell
-                        remaining_sell = 0
+                    if target_index is None or closest_diff > 5.0:
                         break
 
-                i += 1
+                lv = open_levels[target_index]
+                lv_size = float(lv["size"])
+
+                if remaining_sell >= lv_size - 0.00001:
+                    remaining_sell -= lv_size
+                    open_levels.pop(target_index)
+                    continue
+
+                lv["size"] = lv_size - remaining_sell
+                remaining_sell = 0
+                break
 
     open_levels = sorted(open_levels, key=lambda x: float(x["buy_price"]))
 
@@ -846,6 +1407,10 @@ def rebuild_levels_from_fills(pos_size):
         if float(lv["size"]) > 0.00001:
             state["levels"].append(lv)
 
+    state["last_grid_buy_price"] = last_grid_buy_price
+    if open_levels:
+        first_buy = float(open_levels[0]["buy_price"])
+        state["cycle_base_series"] = get_series_floor(first_buy)
     sort_levels()
 
     print("REBUILD DONE. LEVELS:", state["levels"])
@@ -879,6 +1444,12 @@ def mismatch_protection_check():
 
     # MANUAL TRADE SAFE MODE (MAIN FIX)
     if abs(total_levels - pos_size) > 0.01:
+        if has_fresh_pending_orders():
+            print("MISMATCH DETECTED BUT BOT ORDER IS STILL PENDING -> WAITING FOR FILL SYNC")
+            print("EXCHANGE POS:", pos_size, "STATE LEVEL SUM:", total_levels)
+            sys.stdout.flush()
+            return
+
         try:
             live_price = get_live_price()
         except:
@@ -899,12 +1470,121 @@ def mismatch_protection_check():
             rebuild_levels_from_fills(pos_size)
 
 
+def bootstrap_current_fills_as_processed(page_size=None):
+    """
+    Critical safety guard.
+    On a fresh deploy/restart with an empty state file, Delta returns old fills.
+    Those historical fills must not be treated as new trades, otherwise old sells
+    create stale buybacks and the bot can place many immediate market buys.
+    """
+
+    global processed_fill_set
+
+    if page_size is None:
+        page_size = RECOVERY_FILL_SCAN
+
+    fills = get_fills(page_size=page_size)
+    fill_ids = []
+
+    for f in fills:
+        if f.get("product_symbol") != SYMBOL:
+            continue
+
+        fid = f.get("id")
+        if fid is None:
+            continue
+
+        fill_ids.append(fid)
+
+    if not fill_ids:
+        return
+
+    for fid in fill_ids:
+        if fid not in processed_fill_set:
+            processed_fill_set.add(fid)
+            state["processed_fill_ids"].append(fid)
+
+    # Keep startup state clean. Pending orders/buybacks are only valid if this
+    # exact bot created them in the current persisted state.
+    state["pending_orders"] = {}
+
+    if len(state["processed_fill_ids"]) > 5000:
+        state["processed_fill_ids"] = state["processed_fill_ids"][-2000:]
+
+    state["state_schema_version"] = STATE_SCHEMA_VERSION
+    save_state()
+
+    print("BOOTSTRAP SAFETY: MARKED EXISTING FILLS AS PROCESSED:", len(fill_ids))
+    sys.stdout.flush()
+
+
+def pending_buyback_exists_for_fill(fill_id):
+    if fill_id is None:
+        return False
+
+    for b in state.get("pending_buybacks", []):
+        if str(b.get("source_fill_id")) == str(fill_id):
+            return True
+
+    return False
+
+
+def recover_recent_sell_buybacks():
+    """
+    Disabled on purpose.
+    Historical sell recovery can create stale buyback orders after deployment.
+    Buybacks are created only from fresh fills processed while this bot is
+    running with a valid processed_fill_ids state.
+    """
+    return
+
+
 # ============================================================
 # STARTUP
 # ============================================================
 
 print("STATE LOADED:", state)
 sys.stdout.flush()
+
+# ============================================================
+# AUTO CLEANUP FOR FREE RENDER RESTARTS
+# ============================================================
+
+try:
+
+    # remove stale pending orders
+    state["pending_orders"] = {}
+
+    # remove stale reserved prices
+    state["pending_grid_prices"] = {}
+
+    # remove stale buybacks older than live rebuild
+    if state.get("levels"):
+        valid_buybacks = []
+
+        for b in state.get("pending_buybacks", []):
+
+            try:
+                bp = float(b.get("buy_price"))
+
+                # keep only nearby realistic buybacks
+                if any(abs(float(lv["buy_price"]) - bp) <= GRID * 2 for lv in state["levels"]):
+                    valid_buybacks.append(b)
+
+            except:
+                pass
+
+        state["pending_buybacks"] = valid_buybacks
+
+    save_state()
+
+    print("AUTO CLEANUP COMPLETE")
+    sys.stdout.flush()
+
+except Exception as cleanup_error:
+
+    print("AUTO CLEANUP ERROR:", str(cleanup_error))
+    sys.stdout.flush()
 
 try:
     price = get_live_price()
@@ -913,12 +1593,13 @@ try:
     print("STARTUP LIVE PRICE:", price)
     print("STARTUP POS SIZE:", pos_size)
     sys.stdout.flush()
-
-    if state.get("cycle_base_series") is None and pos_size > 0:
-        state["cycle_base_series"] = get_series_floor(price)
-        save_state()
-
+    
     mismatch_protection_check()
+
+    if state_needs_fill_bootstrap:
+        print("STATE UPGRADE/FRESH START -> BOOTSTRAPPING FILL IDS ONLY")
+        sys.stdout.flush()
+        bootstrap_current_fills_as_processed()
 
 except Exception as e:
     print("STARTUP ERROR:", str(e))
@@ -939,8 +1620,10 @@ try:
             MAX_REENTRY_SIZE = float(os.getenv("MAX_REENTRY_SIZE", "200"))
             SERIES_STEP = float(os.getenv("SERIES_STEP", "100"))
             SERIES_ADD_LOT = float(os.getenv("SERIES_ADD_LOT", "0"))
+            PENDING_ORDER_WAIT_SECONDS = int(os.getenv("PENDING_ORDER_WAIT_SECONDS", "60"))
 
             process_new_fills()
+            cleanup_stale_grid_reservations()
             mismatch_protection_check()
 
             price = get_live_price()
@@ -953,15 +1636,11 @@ try:
                 continue
 
             current_series = get_series_floor(price)
-
-            if state.get("cycle_base_series") is None:
-                state["cycle_base_series"] = current_series
-                save_state()
-
+            
             dynamic_lot = calculate_dynamic_lot(current_series, state.get("cycle_base_series"))
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"{now} PRICE:{price} POS:{pos_size} CYCLE_SERIES:{state.get('cycle_base_series')} DYNAMIC_LOT:{dynamic_lot} NEXT_BUY:{get_next_buy_price()} LEVELS:{state.get('levels')}")
+            print(f"{now} PRICE:{price} POS:{pos_size} CYCLE_SERIES:{state.get('cycle_base_series')} DYNAMIC_LOT:{dynamic_lot} NEXT_BUY:{get_next_buy_price()} LEVELS:{state.get('levels')} BUYBACKS:{state.get('pending_buybacks')}")
             sys.stdout.flush()
 
             # ============================================================
@@ -986,12 +1665,13 @@ try:
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
-                    mark_action("buy", price, order_id)
+                    mark_action("buy", price, order_id, size=entry_size, source="entry")
 
-                    # IMPORTANT: cycle level stored manually
-                    add_level(price, entry_size, is_cycle=True)
+                    time.sleep(3)
+                    process_new_fills()
 
-                    time.sleep(1)
+                    # EXTRA SAFETY
+                    time.sleep(2)
                     process_new_fills()
 
                 time.sleep(SLEEP_SECONDS)
@@ -1001,34 +1681,99 @@ try:
             # MULTI BUY LOOP (PRICE JUMP DOWN)
             # ============================================================
             while True:
-                next_buy = get_next_buy_price()
-                if next_buy is None:
+
+                if has_fresh_pending_orders():
+                    print("PENDING ORDER EXISTS -> WAITING")
+                    sys.stdout.flush()
                     break
+
+                buy_target = get_next_buy_target()
+
+                if buy_target is None:
+                    break
+
+                next_buy = float(buy_target["buy_price"])
 
                 if price > next_buy:
                     break
 
                 if already_executed_same_price("buy", next_buy):
-                    break
+
+                    print("DUPLICATE BUY BLOCKED:", next_buy)
+                    sys.stdout.flush()
+
+                    price = get_live_price()
+                    continue
 
                 current_series = get_series_floor(price)
                 dynamic_lot = calculate_dynamic_lot(current_series, state.get("cycle_base_series"))
+                buy_size = float(buy_target["size"]) if buy_target.get("source") == "buyback" else dynamic_lot
 
-                print("GRID BUY TRIGGERED AT:", next_buy, "BUY SIZE:", dynamic_lot)
+                print("GRID BUY TRIGGERED AT:", next_buy, "BUY SIZE:", buy_size, "SOURCE:", buy_target.get("source"))
                 sys.stdout.flush()
 
-                resp = place_market_order("buy", dynamic_lot)
+                # ============================================================
+                # HARD DUPLICATE BUY BLOCK
+                # ============================================================
+
+                existing_same_level = False
+
+                for lv in state["levels"]:
+
+                    if abs(float(lv["buy_price"]) - float(next_buy)) < 0.05:
+
+                        existing_same_level = True
+                        break
+
+                if existing_same_level:
+
+                    print("BLOCKED DUPLICATE BUY LEVEL:", next_buy)
+                    sys.stdout.flush()
+                    break
+
+                resp = place_market_order("buy", buy_size)
 
                 if resp.get("success") is True:
-                    order_id = resp.get("result", {}).get("id")
-                    mark_action("buy", next_buy, order_id)
 
-                    time.sleep(1)
+                    # ============================================================
+                    # RESERVE THIS GRID PRICE IMMEDIATELY
+                    # ============================================================
+
+                    price_key = str(round(float(next_buy), 2))
+
+                    state["pending_grid_prices"][price_key] = {
+                        "price": float(next_buy),
+                        "created_at": int(time.time())
+                    }
+
+                    save_state()
+
+                    order_id = resp.get("result", {}).get("id")
+
+                    mark_action(
+                        "buy",
+                        next_buy,
+                        order_id,
+                        size=buy_size,
+                        source=buy_target.get("source"),
+                        extra={
+                            "buyback_id": buy_target.get("buyback_id"),
+                            "is_cycle": bool(buy_target.get("is_cycle", False))
+                        }
+                    )
+
+                    time.sleep(3)
+                    process_new_fills()
+
+                    # EXTRA SAFETY
+                    time.sleep(2)
                     process_new_fills()
 
                     pos_size = get_open_position_size()
+
                     if pos_size < 0:
                         break
+
                 else:
                     break
 
@@ -1039,6 +1784,12 @@ try:
             # MULTI SELL LOOP (PRICE JUMP UP)
             # ============================================================
             while True:
+                if has_fresh_pending_orders():
+
+                    print("PENDING SELL/BUY ORDER EXISTS -> WAITING")
+                    sys.stdout.flush()
+
+                    break
                 sell_level = get_next_sell_target(price)
                 if sell_level is None:
                     break
@@ -1047,7 +1798,12 @@ try:
                 desired_sell_size = float(sell_level["size"])
 
                 if already_executed_same_price("sell", sell_price):
-                    break
+
+                    print("DUPLICATE SELL BLOCKED:", sell_price)
+                    sys.stdout.flush()
+
+                    price = get_live_price()
+                    continue
 
                 pos_size = get_open_position_size()
                 if pos_size <= 0:
@@ -1063,13 +1819,49 @@ try:
                 print("GRID SELL TRIGGERED AT:", sell_price, "SELL SIZE:", sell_size)
                 sys.stdout.flush()
 
+                # ============================================================
+                # HARD DUPLICATE SELL BLOCK
+                # ============================================================
+
+                existing_same_sell = 0.0
+
+                for lv in state["levels"]:
+
+                    if abs(float(lv["sell_price"]) - float(sell_price)) < 0.05:
+
+                        existing_same_sell += float(lv.get("size", 0))
+
+                # if already almost exhausted -> skip only this level
+                if existing_same_sell <= 0:
+
+                    print("SELL LEVEL ALREADY EMPTY:", sell_price)
+                    sys.stdout.flush()
+
+                    price = get_live_price()
+                    continue
+
                 resp = place_market_order("sell", sell_size)
 
                 if resp.get("success") is True:
                     order_id = resp.get("result", {}).get("id")
-                    mark_action("sell", sell_price, order_id)
+                    mark_action(
+                        "sell",
+                        sell_price,
+                        order_id,
+                        size=sell_size,
+                        source="sell",
+                        extra={
+                            "buy_price": float(sell_level.get("buy_price")),
+                            "sell_price": sell_price,
+                            "is_cycle": bool(sell_level.get("is_cycle", False))
+                        }
+                    )
 
-                    time.sleep(1)
+                    time.sleep(3)
+                    process_new_fills()
+
+                    # EXTRA SAFETY
+                    time.sleep(2)
                     process_new_fills()
 
                     pos_size = get_open_position_size()
