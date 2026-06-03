@@ -167,6 +167,7 @@ def default_state():
 
         # reentry lock
         "last_reentry_time": 0,
+        "last_position_zero_time": 0,    
 
         # duplicate grid protection
         "pending_grid_prices": {}
@@ -221,6 +222,9 @@ def load_state():
 
         if d.get("last_reentry_time") is None:
             d["last_reentry_time"] = 0
+            
+        if d.get("last_position_zero_time") is None:
+            d["last_position_zero_time"] = 0    
         
         if d.get("last_action_time") is None:
             d["last_action_time"] = 0    
@@ -584,8 +588,8 @@ def cleanup_stale_grid_reservations():
 
         created_at = int(data.get("created_at", 0))
 
-        # 60 sec expiry
-        if now - created_at > 60:
+        # 180 sec expiry
+        if now - created_at > 180:
             stale_keys.append(price_key)
 
     if stale_keys:
@@ -754,6 +758,7 @@ def get_total_level_size():
 
 
 def reset_all_levels():
+    state["last_position_zero_time"] = int(time.time())
     state["levels"] = []
     state["pending_buybacks"] = []
     state["pending_orders"] = {}
@@ -913,10 +918,12 @@ def get_next_buy_target():
 
     if downside_buy is not None:
 
-         price_key = str(round(float(downside_buy), 2))
+        for rp in reserved_prices.values():
 
-         if price_key in reserved_prices:
-             downside_buy = None
+            if abs(float(rp["price"]) - float(downside_buy)) < (GRID * 0.5):
+
+                downside_buy = None
+                break
 
     if downside_buy is not None:
         candidates.append({
@@ -1647,7 +1654,19 @@ try:
             # POSITION 0 -> MULTIPLIER ENTRY (STRICT)
             # ============================================================
             if pos_size == 0:
+
+                zero_time = int(state.get("last_position_zero_time", 0))
+
+                if int(time.time()) - zero_time < 10:
+
+                    print("POSITION JUST CLOSED -> WAITING 10 SEC")
+                    sys.stdout.flush()
+
+                    time.sleep(SLEEP_SECONDS)
+                    continue
+
                 if not can_reenter_now():
+        
                     print("REENTRY COOLDOWN ACTIVE -> SKIPPING MULTIPLIER BUY")
                     sys.stdout.flush()
                     time.sleep(SLEEP_SECONDS)
@@ -1686,6 +1705,13 @@ try:
                     print("PENDING ORDER EXISTS -> WAITING")
                     sys.stdout.flush()
                     break
+                reserved_prices = state.get("pending_grid_prices", {})
+
+                if reserved_prices:
+
+                    print("GRID PRICE RESERVED -> WAITING FOR FILL")
+                    sys.stdout.flush()
+                    break       
 
                 buy_target = get_next_buy_target()
 
@@ -1720,7 +1746,7 @@ try:
 
                 for lv in state["levels"]:
 
-                    if abs(float(lv["buy_price"]) - float(next_buy)) < 0.05:
+                    if abs(float(lv["buy_price"]) - float(next_buy)) < (GRID * 0.5):
 
                         existing_same_level = True
                         break
@@ -1738,7 +1764,9 @@ try:
                     # ============================================================
                     # RESERVE THIS GRID PRICE IMMEDIATELY
                     # ============================================================
-
+                    state["last_grid_buy_price"] = float(next_buy)
+                    save_state()
+                    
                     price_key = str(round(float(next_buy), 2))
 
                     state["pending_grid_prices"][price_key] = {
