@@ -175,6 +175,11 @@ def default_state():
 
 
 def load_state():
+    print("STATE FILE EXISTS:", os.path.exists(STATE_FILE))
+
+    if os.path.exists(STATE_FILE):
+        print("STATE FILE SIZE:", os.path.getsize(STATE_FILE))
+
     global state_needs_fill_bootstrap
 
     if not os.path.exists(STATE_FILE):
@@ -278,6 +283,13 @@ def load_state():
 def save_state():
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
+    print(
+        "STATE SAVED:",
+        "SERIES=", state.get("cycle_base_series"),
+        "LEVELS=", len(state.get("levels", [])),
+        "FILLS=", len(state.get("processed_fill_ids", []))
+    )
 
 
 state = load_state()
