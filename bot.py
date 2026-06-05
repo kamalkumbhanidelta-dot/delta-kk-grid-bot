@@ -1,3 +1,5 @@
+import requests
+import json
 import os
 import sys
 import time
@@ -8,6 +10,73 @@ import requests
 import traceback
 import math
 from datetime import datetime
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+def load_state_from_supabase():
+
+    try:
+
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}"
+        }
+
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/bot_state?id=eq.1&select=state_json",
+            headers=headers,
+            timeout=20
+        )
+
+        data = r.json()
+
+        if not data:
+            return None
+
+        return data[0]["state_json"]
+
+    except Exception as e:
+
+        print("SUPABASE LOAD ERROR:", str(e))
+        return None
+
+
+def save_state_to_supabase(data):
+
+    try:
+
+        headers = {
+            "apikey": SUPABASE_KEY,
+            "Authorization": f"Bearer {SUPABASE_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "resolution=merge-duplicates"
+        }
+
+        payload = {
+            "id": 1,
+            "state_json": data
+        }
+
+        r = requests.post(
+            f"{SUPABASE_URL}/rest/v1/bot_state",
+            headers=headers,
+            json=payload,
+            timeout=20
+        )
+        print("SUPABASE STATUS:", r.status_code)
+        print("SUPABASE RESPONSE:", r.text)
+        
+        print(
+            "SUPABASE STATE SAVED:",
+            "SERIES=", data.get("cycle_base_series"),
+            "LEVELS=", len(data.get("levels", [])),
+            "FILLS=", len(data.get("processed_fill_ids", []))
+        )
+
+    except Exception as e:
+
+        print("SUPABASE SAVE ERROR:", str(e))
 
 # ============================================================
 # DELTA XAUTUSD GRID BOT (FULL FINAL FIX - NO LOGIC MISSING)
@@ -182,13 +251,16 @@ def load_state():
 
     global state_needs_fill_bootstrap
 
-    if not os.path.exists(STATE_FILE):
+    data = load_state_from_supabase()
+
+    if data is None:
+
+        print("NO STATE FOUND IN SUPABASE")
         state_needs_fill_bootstrap = True
         return default_state()
 
     try:
-        with open(STATE_FILE, "r") as f:
-            data = json.load(f)
+        # data already loaded from supabase
 
         raw_version = int(data.get("state_schema_version", 1) or 1)
         if raw_version < STATE_SCHEMA_VERSION:
@@ -281,8 +353,7 @@ def load_state():
 
 
 def save_state():
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+    save_state_to_supabase(state)
 
     print(
         "STATE SAVED:",
