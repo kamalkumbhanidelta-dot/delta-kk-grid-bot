@@ -14,7 +14,14 @@ from datetime import datetime
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
+print("SUPABASE_URL =", SUPABASE_URL)
+print("SUPABASE_KEY EXISTS =", bool(SUPABASE_KEY))
+sys.stdout.flush()
+
 def load_state_from_supabase():
+
+    print("SUPABASE LOAD START")
+    sys.stdout.flush()
 
     try:
 
@@ -28,8 +35,12 @@ def load_state_from_supabase():
             headers=headers,
             timeout=20
         )
+        print("SUPABASE RESPONSE:", r.status_code)
+        sys.stdout.flush()
 
         data = r.json()
+        print("SUPABASE DATA:", data)
+        sys.stdout.flush()
 
         if not data:
             return None
@@ -66,7 +77,7 @@ def save_state_to_supabase(data):
         )
         print("SUPABASE STATUS:", r.status_code)
         print("SUPABASE RESPONSE:", r.text)
-        
+
         print(
             "SUPABASE STATE SAVED:",
             "SERIES=", data.get("cycle_base_series"),
@@ -363,7 +374,14 @@ def save_state():
     )
 
 
-state = load_state()
+try:
+    state = load_state()
+    print("STATE LOADED OK")
+    sys.stdout.flush()
+except Exception as e:
+    print("LOAD STATE FAILED:", str(e))
+    sys.stdout.flush()
+    raise
 
 # in-memory processed set (to stop duplicates instantly)
 processed_fill_set = set(state.get("processed_fill_ids", []))
