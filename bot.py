@@ -1272,7 +1272,7 @@ def rebuild_levels_from_fills(pos_size):
     Instead we trim open_levels to match pos_size.
     """
     old_cycle_series = state.get("cycle_base_series")
-    
+
     print("REBUILDING LEVELS FROM FILLS HISTORY...")
     sys.stdout.flush()
 
@@ -1694,6 +1694,7 @@ try:
                 entry_size = calculate_reentry_size()
 
                 state["cycle_base_series"] = get_series_floor(price)
+                save_state()
                 mark_reentry_time()
 
                 resp = place_market_order("buy", entry_size)
