@@ -767,7 +767,10 @@ def reset_all_levels():
     state["cycle_entry_size"] = None
     state["cycle_entry_price"] = None
     state["cycle_entry_sell_price"] = None
-    state["cycle_base_series"] = None
+
+    # series preserve
+    if get_open_position_size() == 0:
+        state["cycle_base_series"] = None
     save_state()
 
 
@@ -1268,7 +1271,8 @@ def rebuild_levels_from_fills(pos_size):
     FIXED: No proportional scaling (fractional bug removed).
     Instead we trim open_levels to match pos_size.
     """
-
+    old_cycle_series = state.get("cycle_base_series")
+    
     print("REBUILDING LEVELS FROM FILLS HISTORY...")
     sys.stdout.flush()
 
@@ -1413,11 +1417,18 @@ def rebuild_levels_from_fills(pos_size):
     for lv in open_levels:
         if float(lv["size"]) > 0.00001:
             state["levels"].append(lv)
+    
+    old_cycle_series = state.get("cycle_base_series")
 
     state["last_grid_buy_price"] = last_grid_buy_price
 
     # DO NOT OVERWRITE EXISTING SERIES
-    if not state.get("cycle_base_series") and open_levels:
+    if old_cycle_series is not None:
+
+        state["cycle_base_series"] = old_cycle_series
+
+    elif open_levels:
+
         first_buy = float(open_levels[0]["buy_price"])
         state["cycle_base_series"] = get_series_floor(first_buy)
 
