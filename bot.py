@@ -1415,9 +1415,12 @@ def rebuild_levels_from_fills(pos_size):
             state["levels"].append(lv)
 
     state["last_grid_buy_price"] = last_grid_buy_price
-    if open_levels:
+
+    # DO NOT OVERWRITE EXISTING SERIES
+    if not state.get("cycle_base_series") and open_levels:
         first_buy = float(open_levels[0]["buy_price"])
         state["cycle_base_series"] = get_series_floor(first_buy)
+
     sort_levels()
 
     print("REBUILD DONE. LEVELS:", state["levels"])
@@ -1755,7 +1758,19 @@ try:
 
                     print("BLOCKED DUPLICATE BUY LEVEL:", next_buy)
                     sys.stdout.flush()
-                    break
+
+                    # skip this target and move ahead
+                    if buy_target.get("source") == "buyback":
+
+                        buyback_id = buy_target.get("buyback_id")
+
+                        state["pending_buybacks"] = [
+                            b for b in state["pending_buybacks"]
+                            if b.get("id") != buyback_id
+                        ]
+                        save_state()
+
+                    continue
 
                 resp = place_market_order("buy", buy_size)
 
