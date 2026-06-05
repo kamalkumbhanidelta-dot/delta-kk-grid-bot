@@ -1423,6 +1423,8 @@ def rebuild_levels_from_fills(pos_size):
 
     sort_levels()
 
+    save_state()
+
     print("REBUILD DONE. LEVELS:", state["levels"])
     sys.stdout.flush()
 
